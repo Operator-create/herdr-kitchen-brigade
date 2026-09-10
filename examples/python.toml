@@ -1,0 +1,9 @@
+# Copy to .kitchen-brigade.toml at your Git repository's root.
+# Use your project's virtual environment directly; no activation is needed.
+[verify]
+commands = [".venv/bin/python -m unittest discover -s tests -v"]
+timeout_seconds = 300
+
+[report]
+on_fail = "prompt"
+on_pass = "silent"

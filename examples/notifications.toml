@@ -1,0 +1,8 @@
+# Notification-only feedback for people who prefer to drive the repair loop.
+[verify]
+commands = ["git diff --check"]
+timeout_seconds = 30
+
+[report]
+on_fail = "notify"
+on_pass = "notify"

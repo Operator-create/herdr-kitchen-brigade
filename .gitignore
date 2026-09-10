@@ -1,0 +1,11 @@
+# Private planning notes and recordings are never part of the community release.
+HANDOFF*.md
+reference/
+PRIVATE-*.md
+
+__pycache__/
+*.py[cod]
+.venv/
+.coverage
+.DS_Store
+.kitchen-brigade.toml

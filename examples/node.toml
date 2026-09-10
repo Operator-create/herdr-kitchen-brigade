@@ -1,0 +1,9 @@
+# Copy to .kitchen-brigade.toml at your Git repository's root.
+# Replace these with scripts your project actually provides.
+[verify]
+commands = ["npm run lint", "npm test"]
+timeout_seconds = 300
+
+[report]
+on_fail = "prompt"
+on_pass = "silent"

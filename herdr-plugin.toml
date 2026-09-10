@@ -1,0 +1,36 @@
+id = "kitchen-brigade"
+name = "Kitchen Brigade"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+platforms = ["linux"]
+description = "Run repository-owned checks when a coding agent reports done."
+
+[[actions]]
+id = "expedite"
+title = "Kitchen Brigade: expedite this pane"
+contexts = ["pane"]
+command = ["sh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/brigade.py\" action-run"]
+
+[[actions]]
+id = "last-call"
+title = "Kitchen Brigade: last call"
+contexts = ["global", "workspace", "pane"]
+command = ["sh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/brigade.py\" action-status"]
+
+[[actions]]
+id = "doctor"
+title = "Kitchen Brigade: doctor"
+contexts = ["global"]
+command = ["sh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/brigade.py\" action-status"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["sh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/brigade.py\" event"]
+
+[[panes]]
+id = "board"
+title = "Kitchen Brigade"
+placement = "popup"
+width = 96
+height = 28
+command = ["sh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/brigade.py\" board"]
