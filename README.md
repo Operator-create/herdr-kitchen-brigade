@@ -47,6 +47,7 @@ Create `.kitchen-brigade.toml` at the root of a Git repository you work in:
 [verify]
 commands = ["npm run lint", "npm test"]
 timeout_seconds = 300
+stop_on_first_failure = true
 
 [report]
 on_fail = "prompt"
@@ -70,25 +71,42 @@ No keyboard shortcut is installed automatically.
 
 ## Agents launched from a home directory
 
-Herdr reports a pane's foreground directory, but an agent can edit files
-elsewhere without changing that directory. Kitchen Brigade cannot infer which
-project you meant from a conversation.
+Herdr reports a pane's foreground directory. Most agents are started from a home
+directory and never change it, so that directory names no repository at all. A
+pane like that resolves to nothing and its checks are skipped.
 
-Bind that pane explicitly using the plugin's local `brigade.py` entrypoint:
+Register the repositories you work in once, and Kitchen Brigade will use them
+when a pane resolves to nothing:
+
+```sh
+python3 /path/to/herdr-kitchen-brigade/brigade.py watch --root ~/projects
+```
+
+`--root` adopts every repository directly beneath that directory that already
+carries `.kitchen-brigade.toml`; it never enrols a project that has not opted in.
+Use `--repo` for a single repository, `--list` to see the registry, and
+`unwatch --repo` to remove one. `herdr plugin list --json --plugin
+kitchen-brigade` shows the installed `plugin_root`.
+
+When a pane resolves to nothing, the plugin fingerprints each watched repository
+and checks the one that changed since it last looked. Failure feedback is typed
+back to the finishing pane only when exactly one watched repository changed and
+no other agent is working; otherwise you get a notification, because inference
+cannot prove which agent did the work. If two watched repositories changed at
+once, nothing runs and the notification names them. Those repositories stay
+candidates, so the next completion says so again rather than forgetting.
+
+A pane that does sit inside its repository needs none of this. You can also bind
+one explicitly, which takes precedence over the registry:
 
 ```sh
 python3 /path/to/herdr-kitchen-brigade/brigade.py bind \
   --pane w1:p2 --repo /path/to/project
 ```
 
-`herdr plugin list --json --plugin kitchen-brigade` shows the installed
-`plugin_root`. Run the command inside the same Herdr session as the agent.
-Bindings are local session state, scoped to the pane's terminal identity.
-Rebind when you switch projects, and remove a binding with:
-
-```sh
-python3 /path/to/herdr-kitchen-brigade/brigade.py unbind --pane w1:p2
-```
+Run it inside the same Herdr session as the agent. Bindings are local session
+state, scoped to the pane's terminal identity, and are removed with
+`unbind --pane w1:p2`.
 
 ## Configuration and results
 
@@ -97,16 +115,75 @@ repository root. `timeout_seconds` bounds the whole suite. Commands run with
 standard input closed; checks must be noninteractive.
 
 `report.on_fail` accepts `prompt`, `notify`, or `log`. `report.on_pass` accepts
-`silent` or `notify`. A prompt contains at most three lines and points to the
-full local report. A pane that has become blocked, working, or otherwise
-changed will receive a notification fallback instead of typed feedback.
+`silent` or `notify`. A prompt contains at most three lines: the command that
+failed with its exit code, that command's last meaningful output line, and where
+to read the rest. A pane that has become blocked, working, or otherwise changed
+will receive a notification fallback instead of typed feedback.
+
+`verify.stop_on_first_failure` defaults to true. Set it to false to run the whole
+suite and report every regression at once, rather than sending the agent back for
+each one in turn.
+
+## Repositories that are not already green
+
+Most repositories fail something before an agent touches them. Left alone, the
+gate blames every agent for failures it inherited, twice, and then goes quiet.
+Record what the repository already fails:
+
+```sh
+python3 /path/to/herdr-kitchen-brigade/brigade.py accept --repo /path/to/project
+```
+
+`accept` runs the whole suite regardless of exit codes and stores each failing
+command's exit code as that repository's baseline. Afterwards a command that
+fails with its baselined exit code is reported as pre-existing and never stops
+the suite, so a stale lint error can no longer hide the typecheck behind it. Any
+other exit code, including a newly failing command, is a regression and is fed
+back to the agent. Run `accept` again whenever you deliberately change what the
+repository tolerates.
+
+A baseline is keyed by the exact command string, so editing a command in
+`.kitchen-brigade.toml` discards its licence rather than carrying it over.
+
+## Which failures are yours
+
+The snapshot records a digest per file, so the plugin knows exactly which paths
+changed since it last looked. When a check fails it reads that command's output,
+picks out the paths the checker named, and reports the overlap:
+
+```text
+Changed since the last check: 2 path(s).
+This failure names 1 of them:
+  src/beta.js
+```
+
+A bare filename counts only when exactly one changed path has that name, because
+guessing between two would be worse than saying nothing. When a failure names
+none of the files that changed, the summary says so, which usually means the
+failure predates the work rather than being caused by it.
+
+If `.kitchen-brigade.toml` is one of the files that changed in a snapshot
+verified for an agent pane, the report and summary carry an alert, `doctor`
+fails, and a notification is sent unless `report.on_fail` is `log`. An agent
+editing its own checks is the one event this plugin most needs to surface. You
+will also see it when you edit the configuration yourself and an agent completes
+before the next check; a foreground run does not raise it.
+
+## Where the agent reads the failure
+
+On a failure the plugin writes a short summary, at most sixty lines, to
+`.kitchen-brigade/last-failure.txt` inside the repository, and points the agent
+there. The full output stays in the plugin state directory, which many agents
+cannot read because their file tools are bounded to the project. The directory
+ignores itself, so it never becomes part of a snapshot.
 
 | Result | Meaning |
 | --- | --- |
 | Passed | Every configured command returned zero on a stable snapshot |
+| Baseline | Nothing regressed; the only failures match the recorded baseline |
 | Failed | A command failed or timed out; see its report |
 | Error | Verification could not be completed reliably |
-| Skipped | No opt-in, unchanged snapshot, or a check is already running |
+| Skipped | No opt-in, unchanged snapshot, an ambiguous attribution, or a check is already running |
 
 The first observed snapshot is checked even if its Git working tree is clean.
 A clean Git tree is not evidence that its checks pass. Later unchanged
@@ -120,6 +197,13 @@ Automatic duplicate feedback is suppressed to keep repeated `done` events from
 creating a repair loop: one prompt per failed snapshot, and at most two prompts
 per pane and repository until a check passes. Manual runs can force a fresh
 check; they do not override the prompt limit.
+
+`doctor` reports outcomes, not only wiring. It reads the plugin's own audit log
+and prints how many completions were dispatched in the last day, how many
+produced a verdict for a pane, and why the rest were skipped. Completions that
+never verify are a failure, and it exits non-zero. A foreground run carries no
+pane, so it does not count toward that total. Check it whenever the gate has
+been quiet.
 
 Reports and plugin state live under `HERDR_PLUGIN_STATE_DIR`, outside the
 installed source directory. The results board shows the latest outcomes;

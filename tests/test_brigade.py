@@ -95,6 +95,16 @@ class BrigadeAcceptance(unittest.TestCase):
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+        # A detached worker outlives the assertion that observed its evidence: a
+        # test can see its report while it is still writing state and snapshots.
+        # Removing the tree underneath it fails with ENOTEMPTY, so retry briefly
+        # rather than leaving the suite intermittently red.
+        for _ in range(40):
+            try:
+                self.temp.cleanup()
+                return
+            except OSError:
+                time.sleep(0.1)
         self.temp.cleanup()
 
     def make_repo(self, name):
@@ -210,6 +220,10 @@ class BrigadeAcceptance(unittest.TestCase):
             return False
         return status.rsplit(")", 1)[1].strip().split()[0] != "Z"
 
+    def touch(self, repo):
+        """Give the watched registry something new to find."""
+        (repo / "tracked.txt").write_text(f"edited {repo.name} {time.monotonic()}\n")
+
     def test_pass_runs_configured_checker_and_silent_policy_is_silent(self):
         self.configure([self.counted_command()])
         self.assert_exit(self.run_gate(), 0)
@@ -228,9 +242,13 @@ class BrigadeAcceptance(unittest.TestCase):
         body = prompts[0][-1]
         self.assertLessEqual(len(body.splitlines()), 3)
         self.assertNotIn("`", body)
+        self.assertIn("exit 7", body)
+        summary = self.repo / ".kitchen-brigade/last-failure.txt"
+        self.assertIn(str(summary), body)
+        self.assertIn("checker evidence", summary.read_text())
         reports = self.reports()
         self.assertEqual(len(reports), 1)
-        self.assertIn(str(reports[0]), body)
+        self.assertIn(str(reports[0]), summary.read_text())
         report = reports[0].read_text()
         self.assertIn("checker evidence", report)
         self.assertIn("7", report)
@@ -586,6 +604,297 @@ class BrigadeAcceptance(unittest.TestCase):
         (self.repo / "module/tracked.txt").write_text("new module contents\n")
         self.assert_exit(self.run_gate(pane=None), 0)
         self.assertEqual(self.runs(), ["run", "run"])
+    def test_watched_repository_resolves_a_pane_launched_outside_any_repository(self):
+        self.configure([self.counted_command(exit_code=1)])
+        self.set_agents(self.agent(repo=self.base))
+        self.assert_exit(self.run_cli("watch", "--repo", str(self.repo)), 0)
+        self.touch(self.repo)
+        self.assert_exit(self.run_cli("check", "--pane", PANE), 0)
+        self.wait_for(lambda: len(self.calls("agent", "prompt")) == 1)
+        self.assertEqual(self.runs(), ["run"])
+
+    def test_unchanged_watched_repository_is_not_checked_again(self):
+        self.configure([self.counted_command()])
+        self.set_agents(self.agent(repo=self.base))
+        self.assert_exit(self.run_cli("watch", "--repo", str(self.repo)), 0)
+        self.touch(self.repo)
+        self.assert_exit(self.run_cli("check", "--pane", PANE), 0)
+        self.wait_for(lambda: self.runs() == ["run"])
+        self.wait_for(lambda: any("-pass.txt" in str(path) for path in self.reports()))
+        self.assert_exit(self.run_cli("check", "--pane", PANE), 0)
+        self.wait_for(lambda: "no_watched_change" in (self.state / "events.jsonl").read_text())
+        self.assertEqual(self.runs(), ["run"])
+
+    def test_two_changed_watched_repositories_are_not_attributed_to_one_pane(self):
+        second = self.make_repo("second repository")
+        self.configure([self.counted_command()])
+        self.configure([self.counted_command(marker="second runs.txt")], repo=second)
+        self.set_agents(self.agent(repo=self.base))
+        self.assert_exit(self.run_cli("watch", "--repo", str(self.repo)), 0)
+        self.assert_exit(self.run_cli("watch", "--repo", str(second)), 0)
+        self.touch(self.repo)
+        self.touch(second)
+        self.assert_exit(self.run_cli("check", "--pane", PANE), 0)
+        self.wait_for(lambda: bool(self.calls("notification", "show")))
+        self.assertIn("ambiguous_watched", (self.state / "events.jsonl").read_text())
+        self.assertEqual(self.runs(), [])
+        self.assertEqual(self.runs("second runs.txt"), [])
+        self.assertEqual(self.calls("agent", "prompt"), [])
+
+    def test_ambiguous_candidates_stay_candidates_for_the_next_event(self):
+        second = self.make_repo("second repository")
+        self.configure([self.counted_command()])
+        self.configure([self.counted_command(marker="second runs.txt")], repo=second)
+        self.set_agents(self.agent(repo=self.base))
+        self.assert_exit(self.run_cli("watch", "--repo", str(self.repo)), 0)
+        self.assert_exit(self.run_cli("watch", "--repo", str(second)), 0)
+        self.touch(self.repo)
+        self.touch(second)
+        self.assert_exit(self.run_cli("check", "--pane", PANE), 0)
+        self.wait_for(lambda: "ambiguous_watched" in (self.state / "events.jsonl").read_text())
+        self.assert_exit(self.run_cli("unwatch", "--repo", str(second)), 0)
+        self.assert_exit(self.run_cli("check", "--pane", PANE), 0)
+        self.wait_for(lambda: self.runs() == ["run"])
+
+    def test_inferred_repository_notifies_instead_of_typing_while_another_agent_works(self):
+        self.configure([self.counted_command(exit_code=1)])
+        self.set_agents(self.agent(repo=self.base), self.agent(pane="test:p2", status="working", repo=self.base))
+        self.assert_exit(self.run_cli("watch", "--repo", str(self.repo)), 0)
+        self.touch(self.repo)
+        self.assert_exit(self.run_cli("check", "--pane", PANE), 0)
+        self.wait_for(lambda: any("-fail.txt" in str(path) for path in self.reports()))
+        self.wait_for(lambda: bool(self.calls("notification", "show")))
+        self.assertEqual(self.calls("agent", "prompt"), [])
+        report = next(path for path in self.reports() if "-fail.txt" in str(path))
+        self.assertIn("Prompt withheld", report.read_text())
+
+    def test_watch_root_adopts_only_repositories_that_opted_in(self):
+        second = self.make_repo("second repository")
+        self.make_repo("third repository")
+        self.configure([self.counted_command()])
+        self.configure([self.counted_command(marker="second runs.txt")], repo=second)
+        self.assert_exit(self.run_cli("watch", "--root", str(self.base)), 0)
+        result = self.run_cli("watch", "--list")
+        self.assert_exit(result, 0)
+        self.assertIn(str(self.repo), result.stdout)
+        self.assertIn(str(second), result.stdout)
+        self.assertNotIn("third repository", result.stdout)
+
+    def test_doctor_fails_when_done_events_never_produce_a_verdict(self):
+        self.set_agents(self.agent(repo=self.base))
+        self.assert_exit(self.run_cli("check", "--pane", PANE), 0)
+        self.wait_for(lambda: "no_repository_or_binding" in (self.state / "events.jsonl").read_text())
+        result = self.run_cli("doctor")
+        self.assert_exit(result, 2)
+        self.assertIn("Done events (24h)", result.stdout)
+        self.assertIn("1 dispatched, 0 verified", result.stdout)
+
+    def test_doctor_passes_once_a_watched_repository_verifies(self):
+        self.configure([self.counted_command()])
+        self.set_agents(self.agent(repo=self.base))
+        self.assert_exit(self.run_cli("watch", "--repo", str(self.repo)), 0)
+        self.touch(self.repo)
+        self.assert_exit(self.run_cli("check", "--pane", PANE), 0)
+        self.wait_for(lambda: any("-pass.txt" in str(path) for path in self.reports()))
+        result = self.run_cli("doctor")
+        self.assert_exit(result, 0)
+        self.assertIn("1 dispatched, 1 verified", result.stdout)
+    def test_baseline_tolerates_an_inherited_failure_and_never_prompts_for_it(self):
+        self.configure([self.counted_command(exit_code=3)])
+        self.assert_exit(self.run_cli("accept", "--repo", str(self.repo)), 0)
+        self.assertEqual(self.runs(), ["run"])
+        self.assert_exit(self.run_gate(force=True), 0)
+        self.assertEqual(self.runs(), ["run", "run"])
+        self.assertTrue(any("-baseline.txt" in str(path) for path in self.reports()))
+        self.assertEqual(self.calls("agent", "prompt"), [])
+
+    def test_a_different_exit_code_on_a_baselined_command_is_still_a_regression(self):
+        self.configure([self.counted_command(exit_code=3)])
+        self.assert_exit(self.run_cli("accept", "--repo", str(self.repo)), 0)
+        self.configure([self.counted_command(exit_code=4)])
+        self.assert_exit(self.run_gate(), 1)
+        prompts = self.calls("agent", "prompt")
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("exit 4", prompts[0][-1])
+
+    def test_an_inherited_failure_does_not_hide_a_later_regression(self):
+        inherited = self.counted_command(exit_code=3, marker="first.txt")
+        self.configure([inherited, self.counted_command(exit_code=0, marker="second.txt")])
+        self.assert_exit(self.run_cli("accept", "--repo", str(self.repo)), 0)
+        self.configure([inherited, self.counted_command(exit_code=5, marker="second.txt")])
+        self.assert_exit(self.run_gate(), 1)
+        self.assertEqual(self.runs("first.txt"), ["run", "run"])
+        self.assertEqual(self.runs("second.txt"), ["run", "run"])
+        prompts = self.calls("agent", "prompt")
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("exit 5", prompts[0][-1])
+
+    def test_stop_on_first_failure_false_runs_the_whole_suite(self):
+        first = self.counted_command(exit_code=1, marker="first.txt")
+        second = self.counted_command(exit_code=0, marker="second.txt")
+        (self.repo / ".kitchen-brigade.toml").write_text(
+            "[verify]\ncommands = " + json.dumps([first, second]) + "\n"
+            + "timeout_seconds = 5\nstop_on_first_failure = false\n\n"
+            + "[report]\non_fail = \"prompt\"\non_pass = \"silent\"\n"
+        )
+        self.assert_exit(self.run_gate(), 1)
+        self.assertEqual(self.runs("first.txt"), ["run"])
+        self.assertEqual(self.runs("second.txt"), ["run"])
+
+    def test_summary_lists_every_command_with_its_standing(self):
+        inherited = self.counted_command(exit_code=3, marker="first.txt")
+        self.configure([inherited, self.counted_command(exit_code=0, marker="second.txt")])
+        self.assert_exit(self.run_cli("accept", "--repo", str(self.repo)), 0)
+        self.configure([inherited, self.counted_command(exit_code=5, marker="second.txt")])
+        self.assert_exit(self.run_gate(), 1)
+        summary = (self.repo / ".kitchen-brigade/last-failure.txt").read_text()
+        self.assertIn("Verdict: FAIL", summary)
+        self.assertIn("pre-existing exit 3", summary)
+        self.assertIn("REGRESSED exit 5", summary)
+        self.assertLessEqual(len(summary.splitlines()), 60)
+
+    def test_in_repo_summary_is_not_part_of_the_next_snapshot(self):
+        self.configure([self.counted_command(exit_code=1)])
+        self.assert_exit(self.run_gate(), 1)
+        self.assertTrue((self.repo / ".kitchen-brigade/last-failure.txt").is_file())
+        untracked = self.git(self.repo, "status", "--porcelain", "--untracked-files=all").strip()
+        self.assertEqual(untracked, "?? .kitchen-brigade.toml")
+        self.configure([self.counted_command()])
+        self.assert_exit(self.run_gate(), 0)
+        self.assert_exit(self.run_gate(), 0)
+        self.assertEqual(self.runs(), ["run", "run"])
+
+    def test_registering_a_repository_does_not_make_it_a_candidate_on_its_own(self):
+        self.configure([self.counted_command()])
+        self.set_agents(self.agent(repo=self.base))
+        self.assert_exit(self.run_cli("watch", "--repo", str(self.repo)), 0)
+        self.assert_exit(self.run_cli("check", "--pane", PANE), 0)
+        self.wait_for(lambda: "no_watched_change" in (self.state / "events.jsonl").read_text())
+        self.assertEqual(self.runs(), [])
+        self.touch(self.repo)
+        self.assert_exit(self.run_cli("check", "--pane", PANE), 0)
+        self.wait_for(lambda: self.runs() == ["run"])
+
+    def test_registering_several_repositories_does_not_create_an_ambiguity(self):
+        second = self.make_repo("second repository")
+        self.configure([self.counted_command()])
+        self.configure([self.counted_command(marker="second runs.txt")], repo=second)
+        self.set_agents(self.agent(repo=self.base))
+        self.assert_exit(self.run_cli("watch", "--root", str(self.base)), 0)
+        self.assert_exit(self.run_cli("check", "--pane", PANE), 0)
+        self.wait_for(lambda: "no_watched_change" in (self.state / "events.jsonl").read_text())
+        self.assertNotIn("ambiguous_watched", (self.state / "events.jsonl").read_text())
+        self.touch(second)
+        self.assert_exit(self.run_cli("check", "--pane", PANE), 0)
+        self.wait_for(lambda: self.runs("second runs.txt") == ["run"])
+        self.assertEqual(self.runs(), [])
+
+    def test_unwatched_registry_still_reports_an_unresolved_pane(self):
+        self.configure([self.counted_command()])
+        self.set_agents(self.agent(repo=self.base))
+        self.assert_exit(self.run_cli("check", "--pane", PANE), 0)
+        self.wait_for(lambda: "no_repository_or_binding" in (self.state / "events.jsonl").read_text())
+        self.assertEqual(self.runs(), [])
+
+    def test_accept_marks_the_snapshot_it_captured_as_seen(self):
+        self.configure([self.counted_command(exit_code=2)])
+        self.set_agents(self.agent(repo=self.base))
+        self.assert_exit(self.run_cli("watch", "--repo", str(self.repo)), 0)
+        self.touch(self.repo)
+        self.assert_exit(self.run_cli("accept", "--repo", str(self.repo)), 0)
+        self.assert_exit(self.run_cli("check", "--pane", PANE), 0)
+        self.wait_for(lambda: "no_watched_change" in (self.state / "events.jsonl").read_text())
+        self.assertEqual(self.runs(), ["run"])
+
+    def naming_command(self, *names, exit_code=1, marker="runs.txt"):
+        """A checker that prints file paths the way a linter or compiler does."""
+        target = self.base / marker
+        printed = "".join(f"print({name!r} + ':12:5  error  something is wrong'); " for name in names)
+        return self.python(
+            "from pathlib import Path; "
+            + f"p=Path({str(target)!r}); p.open('a').write('run\\n'); "
+            + printed
+            + f"raise SystemExit({exit_code})"
+        )
+
+    def test_snapshot_digest_is_unchanged_by_keeping_per_file_digests(self):
+        # Fingerprints recorded by earlier versions must stay valid, so the
+        # aggregate digest may not shift when the per-file map is retained.
+        (self.repo / "extra.txt").write_text("untracked\n")
+        os.symlink("tracked.txt", self.repo / "link.txt")
+        script = (
+            "import sys; sys.path.insert(0, %r); "
+            "from kitchen_brigade.runtime import capture_snapshot; "
+            "import pathlib, hashlib, os, stat; "
+            "snap = capture_snapshot(pathlib.Path(%r)); "
+            "print(snap.digest); print(len(snap.files))"
+        ) % (str(ROOT), str(self.repo))
+        first = subprocess.run([sys.executable, "-c", script], text=True, capture_output=True,
+                               env=self.env, timeout=15)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        digest, count = first.stdout.split()
+        self.assertEqual(len(digest), 64)
+        # tracked.txt, extra.txt and the symlink; no config file exists yet.
+        self.assertEqual(int(count), 3)
+        self.configure([self.counted_command()])
+        again = subprocess.run([sys.executable, "-c", script], text=True, capture_output=True,
+                               env=self.env, timeout=15)
+        self.assertNotEqual(again.stdout.split()[0], digest)
+
+    def test_failure_names_which_changed_files_it_cites(self):
+        self.configure([self.counted_command()])
+        self.assert_exit(self.run_gate(), 0)
+        (self.repo / "touched.txt").write_text("agent wrote this\n")
+        (self.repo / "untouched-by-error.txt").write_text("also new\n")
+        self.configure([self.naming_command("touched.txt")])
+        self.assert_exit(self.run_gate(), 1)
+        summary = (self.repo / ".kitchen-brigade/last-failure.txt").read_text()
+        self.assertIn("This failure names 1 of them:", summary)
+        self.assertIn("touched.txt", summary)
+        self.assertNotIn("untouched-by-error.txt", summary)
+
+    def test_failure_that_cites_nothing_you_changed_says_so(self):
+        self.configure([self.counted_command()])
+        self.assert_exit(self.run_gate(), 0)
+        (self.repo / "touched.txt").write_text("agent wrote this\n")
+        self.configure([self.naming_command("vendor/legacy.js")])
+        self.assert_exit(self.run_gate(), 1)
+        summary = (self.repo / ".kitchen-brigade/last-failure.txt").read_text()
+        self.assertIn("names none of them", summary)
+
+    def test_first_check_admits_it_cannot_attribute(self):
+        self.configure([self.naming_command("tracked.txt")])
+        self.assert_exit(self.run_gate(), 1)
+        summary = (self.repo / ".kitchen-brigade/last-failure.txt").read_text()
+        self.assertIn("no earlier snapshot", summary)
+
+    def test_an_agent_editing_the_checks_is_reported(self):
+        self.configure([self.counted_command()])
+        self.assert_exit(self.run_gate(), 0)
+        self.configure([self.counted_command(exit_code=1)])
+        self.assert_exit(self.run_gate(), 1)
+        summary = (self.repo / ".kitchen-brigade/last-failure.txt").read_text()
+        self.assertIn(f"ALERT: {'.kitchen-brigade.toml'} changed", summary)
+        alarms = [call for call in self.calls("notification", "show") if "checks were edited" in call[2]]
+        self.assertEqual(len(alarms), 1)
+        self.assertIn("config_edited", (self.state / "events.jsonl").read_text())
+        doctor = self.run_cli("doctor")
+        self.assert_exit(doctor, 2)
+        self.assertIn("Checks edited by an agent", doctor.stdout)
+
+    def test_editing_the_checks_outside_an_agent_turn_is_not_an_alarm(self):
+        self.configure([self.counted_command()])
+        self.assert_exit(self.run_gate(pane=None), 0)
+        self.configure([self.counted_command(exit_code=1)])
+        self.assert_exit(self.run_gate(pane=None), 1)
+        self.assertNotIn("config_edited", (self.state / "events.jsonl").read_text())
+
+    def test_accept_refuses_to_record_a_baseline_from_an_incomplete_suite(self):
+        self.configure([self.counted_command(sleep=3)], timeout=1)
+        self.assert_exit(self.run_cli("accept", "--repo", str(self.repo)), 2)
+        self.configure([self.counted_command(exit_code=1)])
+        self.assert_exit(self.run_gate(force=True), 1)
+        self.assertEqual(len(self.calls("agent", "prompt")), 1)
 
 
 if __name__ == "__main__":

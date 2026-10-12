@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import selectors
 import shutil
 import signal
@@ -34,6 +35,12 @@ from typing import Any, BinaryIO, Iterator, Mapping, Sequence
 
 PLUGIN_ID = "kitchen-brigade"
 CONFIG_NAME = ".kitchen-brigade.toml"
+SCRATCH_DIR = ".kitchen-brigade"
+SUMMARY_NAME = "last-failure.txt"
+MAX_SUMMARY_LINES = 60
+MAX_SNAPSHOT_FILES = 20000
+MAX_LISTED_PATHS = 12
+MAX_REPORT_SCAN_BYTES = 512 * 1024
 STATE_VERSION = 1
 MAX_REPORT_BYTES = 2 * 1024 * 1024
 MAX_REPORTS = 50
@@ -61,6 +68,15 @@ class Config:
     timeout_seconds: float
     on_fail: str
     on_pass: str
+    stop_on_first_failure: bool = True
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    digest: str
+    files: dict[str, str]
+    undecodable_paths: int = 0
+    total_paths: int = 0
 
 
 @dataclass(frozen=True)
@@ -69,6 +85,7 @@ class CommandResult:
     exit_code: int | None
     timed_out: bool
     duration_seconds: float
+    tail: tuple[str, ...] = ()
 
 
 @dataclass
@@ -127,6 +144,7 @@ def ensure_state_dirs() -> pathlib.Path:
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     (root / "reports").mkdir(exist_ok=True, mode=0o700)
     (root / "locks").mkdir(exist_ok=True, mode=0o700)
+    (root / "snapshots").mkdir(exist_ok=True, mode=0o700)
     return root
 
 
@@ -175,13 +193,15 @@ def load_state() -> dict[str, Any]:
             raise ValueError("state root is not an object")
         if value.get("version") != STATE_VERSION:
             raise ValueError("unsupported state version")
-        for field in ("repos", "bindings", "feedback"):
+        # Added after 0.1.0; a state file written by an earlier build has no registry.
+        value.setdefault("watched", {})
+        for field in ("repos", "bindings", "feedback", "watched"):
             entries = value.get(field)
             if not isinstance(entries, dict) or any(not isinstance(item, dict) for item in entries.values()):
                 raise ValueError(f"invalid {field} state")
         return value
     except FileNotFoundError:
-        return {"version": STATE_VERSION, "repos": {}, "bindings": {}, "feedback": {}}
+        return {"version": STATE_VERSION, "repos": {}, "bindings": {}, "feedback": {}, "watched": {}}
     except Exception as exc:
         raise BrigadeError(f"cannot read state {path}; original preserved: {exc}") from exc
 
@@ -380,8 +400,10 @@ def load_config(repo: pathlib.Path) -> Config | None:
     verify = value.get("verify")
     if not isinstance(verify, dict):
         raise ConfigError("missing [verify] table")
-    if set(value) - {"verify", "report"} or set(verify) - {"commands", "timeout_seconds"}:
-        raise ConfigError("unknown configuration key; expected [verify] commands/timeout_seconds and [report]")
+    if set(value) - {"verify", "report"} or set(verify) - {"commands", "timeout_seconds", "stop_on_first_failure"}:
+        raise ConfigError(
+            "unknown configuration key; expected [verify] commands/timeout_seconds/stop_on_first_failure and [report]"
+        )
     commands = verify.get("commands")
     if not isinstance(commands, list) or not commands or any(
         not isinstance(item, str) or not item.strip() for item in commands
@@ -401,30 +423,37 @@ def load_config(repo: pathlib.Path) -> Config | None:
         raise ConfigError("report.on_fail must be prompt, notify, or log")
     if not isinstance(on_pass, str) or on_pass not in {"silent", "notify"}:
         raise ConfigError("report.on_pass must be silent or notify")
-    return Config(tuple(commands), float(timeout), on_fail, on_pass)
+    stop = verify.get("stop_on_first_failure", True)
+    if not isinstance(stop, bool):
+        raise ConfigError("verify.stop_on_first_failure must be true or false")
+    return Config(tuple(commands), float(timeout), on_fail, on_pass, stop)
 
 
-def _hash_file(hasher: Any, root: pathlib.Path, relative: bytes) -> None:
+def _file_chunk(root: pathlib.Path, relative: bytes) -> bytes:
+    """Everything one path contributes to the snapshot digest, as a single value.
+
+    Returning the bytes rather than feeding a shared hasher lets the same walk
+    produce both the aggregate digest and a per-file digest, which is what makes
+    it possible to say which files an agent actually changed.  The concatenation
+    is byte-identical to the previous streaming form, so digests recorded by
+    earlier versions stay valid.
+    """
     full = os.path.join(os.fsencode(root), relative)
     try:
         metadata = os.lstat(full)
     except FileNotFoundError:
-        hasher.update(b"missing\0")
-        return
-    hasher.update(str(metadata.st_mode).encode("ascii") + b"\0")
+        return b"missing\0"
+    prefix = str(metadata.st_mode).encode("ascii") + b"\0"
     if os.path.islink(full):
-        hasher.update(b"link\0" + os.fsencode(os.readlink(full)) + b"\0")
-        return
+        return prefix + b"link\0" + os.fsencode(os.readlink(full)) + b"\0"
     if stat.S_ISDIR(metadata.st_mode):
         # Git represents submodules and nested repositories by a directory entry.
         nested = pathlib.Path(os.fsdecode(full))
         if repo_root(nested) != nested.resolve():
             raise BrigadeError(f"cannot fingerprint tracked directory: {nested}")
-        hasher.update(b"repository\0" + fingerprint(nested).encode("ascii"))
-        return
+        return prefix + b"repository\0" + fingerprint(nested).encode("ascii")
     if not stat.S_ISREG(metadata.st_mode):
-        hasher.update(b"special\0")
-        return
+        return prefix + b"special\0"
     contents = hashlib.sha256()
     with open(full, "rb", buffering=0) as stream:
         while True:
@@ -432,30 +461,197 @@ def _hash_file(hasher: Any, root: pathlib.Path, relative: bytes) -> None:
             if not chunk:
                 break
             contents.update(chunk)
-    hasher.update(contents.digest())
+    return prefix + contents.digest()
 
 
-def fingerprint(repo: pathlib.Path) -> str:
+def capture_snapshot(repo: pathlib.Path) -> Snapshot:
     """Hash HEAD, index entries, and every tracked/untracked working-tree file.
 
     Git output is kept as bytes and NUL-delimited, so unusual and non-UTF-8 paths
     are unambiguous.  The config is added even if a repository ignores dotfiles.
+    The per-file digests are kept as well as the aggregate: the walk already
+    computed them, and discarding them is what left the plugin unable to say
+    which files an agent touched.
     """
     head = git(repo, "rev-parse", "--verify", "HEAD", check=False)
     head_value = head.stdout.rstrip(b"\n") if head.returncode == 0 else b"<unborn>"
     index = git(repo, "ls-files", "-s", "-z").stdout
     names = git(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard").stdout
-    paths = {item for item in names.split(b"\0") if item}
+    # The plugin's own in-repo scratch directory must never be part of a snapshot,
+    # or writing the agent's summary into it would invalidate the tree it describes.
+    scratch = os.fsencode(SCRATCH_DIR + "/")
+    paths = {item for item in names.split(b"\0") if item and not item.startswith(scratch)}
     config_bytes = os.fsencode(CONFIG_NAME)
     if os.path.lexists(os.path.join(os.fsencode(repo), config_bytes)):
         paths.add(config_bytes)
     hasher = hashlib.sha256()
     hasher.update(b"kitchen-brigade-fingerprint-v3\0HEAD\0" + head_value + b"\0INDEX\0" + index)
+    files: dict[str, str] = {}
+    undecodable = 0
     for relative in sorted(paths):
+        chunk = _file_chunk(repo, relative)
         hasher.update(b"PATH\0" + relative + b"\0")
-        _hash_file(hasher, repo, relative)
+        hasher.update(chunk)
         hasher.update(b"\0")
-    return hasher.hexdigest()
+        try:
+            key = relative.decode("utf-8")
+        except UnicodeDecodeError:
+            # It still counts toward the digest, so change detection is unaffected;
+            # only the per-file attribution list cannot name it.
+            undecodable += 1
+            continue
+        if len(files) < MAX_SNAPSHOT_FILES:
+            files[key] = hashlib.sha256(chunk).hexdigest()[:16]
+    return Snapshot(hasher.hexdigest(), files, undecodable, len(paths))
+
+
+def fingerprint(repo: pathlib.Path) -> str:
+    return capture_snapshot(repo).digest
+
+
+def snapshot_path(repo: pathlib.Path) -> pathlib.Path:
+    digest = hashlib.sha256(os.fsencode(os.fspath(repo))).hexdigest()[:16]
+    return ensure_state_dirs() / "snapshots" / f"{digest}.json"
+
+
+def save_snapshot(repo: pathlib.Path, snapshot: Snapshot) -> None:
+    """Kept out of state.json: this map is large and must not be rewritten on every transaction."""
+    try:
+        atomic_write_json(snapshot_path(repo), {
+            "repo": str(repo),
+            "fingerprint": snapshot.digest,
+            "captured_at": utc_now(),
+            "truncated": len(snapshot.files) < snapshot.total_paths - snapshot.undecodable_paths,
+            "files": snapshot.files,
+        })
+    except OSError as exc:
+        append_event("snapshot_error", repo=str(repo), error=str(exc))
+
+
+def load_snapshot(repo: pathlib.Path) -> Snapshot | None:
+    try:
+        value = json.loads(snapshot_path(repo).read_text(encoding="utf-8"))
+        files = value["files"]
+        if not isinstance(files, dict) or value.get("truncated"):
+            return None
+        return Snapshot(str(value["fingerprint"]), {str(k): str(v) for k, v in files.items()})
+    except (FileNotFoundError, OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def changed_since(previous: Snapshot | None, current: Snapshot) -> list[str] | None:
+    """Paths added, modified, or removed since the plugin last looked.
+
+    None means there is no earlier snapshot to compare against, which is not the
+    same as nothing having changed and must not be reported as such.
+    """
+    if previous is None:
+        return None
+    names = set(previous.files) | set(current.files)
+    return sorted(name for name in names if previous.files.get(name) != current.files.get(name))
+
+
+PATH_TOKEN = re.compile(r"[A-Za-z0-9_./@+-]*[A-Za-z0-9_-]\.[A-Za-z0-9]{1,8}")
+
+
+def cited_changed_paths(text: str, repo: pathlib.Path, changed: Sequence[str]) -> list[str]:
+    """Which of the changed files this failure actually names.
+
+    Checkers print paths, so intersecting the paths in the output with the paths
+    the agent touched turns "lint failed" into "lint failed in code you wrote".
+    A bare filename only counts when exactly one changed path has that name,
+    because guessing between two would be worse than saying nothing.
+    """
+    if not changed:
+        return []
+    by_path = set(changed)
+    by_base: dict[str, list[str]] = {}
+    for item in changed:
+        by_base.setdefault(item.rsplit("/", 1)[-1], []).append(item)
+    prefix = str(repo) + "/"
+    hits: list[str] = []
+    seen: set[str] = set()
+    for match in PATH_TOKEN.finditer(text):
+        token = match.group(0)
+        if token.startswith(prefix):
+            token = token[len(prefix):]
+        token = token.removeprefix("./")
+        if token in by_path:
+            candidate = token
+        else:
+            options = by_base.get(token.rsplit("/", 1)[-1], ())
+            candidate = options[0] if len(options) == 1 else None
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            hits.append(candidate)
+            if len(hits) >= MAX_LISTED_PATHS:
+                break
+    return hits
+
+
+def command_output(report: pathlib.Path, position: int, total: int, command: str) -> str:
+    """Just one command's output, sliced out of the report.
+
+    Scanning the whole report would match the plugin's own header, which lists the
+    changed paths, and the echoed command lines: attribution would then confirm
+    itself from its own output rather than from what the checker said.
+    """
+    try:
+        with report.open("rb") as stream:
+            text = stream.read(MAX_REPORT_SCAN_BYTES).decode("utf-8", "replace")
+    except OSError:
+        return ""
+    marker = f"[{position}/{total}] $ {command}\n"
+    start = text.find(marker)
+    if start < 0:
+        return ""
+    start += len(marker)
+    for terminator in ("\nExit: ", "\nTIMED OUT"):
+        end = text.find(terminator, start)
+        if end >= 0:
+            return text[start:end]
+    return text[start:]
+
+
+def watched_candidates() -> tuple[list[tuple[pathlib.Path, str]], list[str]]:
+    """Which watched repositories moved since the plugin last looked at them.
+
+    Pane resolution fails for every agent launched outside a repository, which is
+    the normal case.  The registry answers the other question instead: of the
+    repositories the operator asked us to watch, which one has new work in it.
+    A repository that has never been looked at counts as changed, matching the
+    rule that the first observed snapshot is always checked.
+    """
+    state = load_state()
+    watched = state.get("watched", {})
+    changed: list[tuple[pathlib.Path, str]] = []
+    problems: list[str] = []
+    for key in sorted(watched):
+        entry = watched[key] if isinstance(watched[key], dict) else {}
+        repo = pathlib.Path(key)
+        if not (repo / CONFIG_NAME).is_file():
+            continue
+        try:
+            current = fingerprint(repo)
+        except (BrigadeError, OSError) as exc:
+            problems.append(f"{repo}: {exc}")
+            continue
+        if entry.get("last_seen_fingerprint") != current:
+            changed.append((repo, current))
+    return changed, problems
+
+
+def mark_watched_seen(repo: pathlib.Path, value: str) -> None:
+    """Record a snapshot as looked at, so the next event does not re-select it.
+
+    Only the repository actually selected is marked.  A changed repository that
+    was passed over stays a candidate, so an ambiguous event keeps complaining
+    instead of quietly forgetting the work.
+    """
+    with state_transaction() as state:
+        entry = state.setdefault("watched", {}).setdefault(str(repo), {})
+        entry["last_seen_fingerprint"] = value
+        entry["last_seen_at"] = utc_now()
 
 
 @contextlib.contextmanager
@@ -532,6 +728,10 @@ def run_command(command: str, repo: pathlib.Path, deadline: float, writer: Repor
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
     timed_out = False
+    # A bounded tail of the command's own output, so a three-line message back to
+    # the agent can name the actual error instead of only a file path.
+    tail: list[bytes] = []
+    pending = b""
     try:
         # A check may close stdout while it keeps running, or exit while a child
         # holds the pipe open. Both cases remain subject to the suite deadline.
@@ -548,6 +748,12 @@ def run_command(command: str, repo: pathlib.Path, deadline: float, writer: Repor
                     continue
                 if data:
                     writer.write(data)
+                    pending += data
+                    if b"\n" in pending or len(pending) > 65536:
+                        *complete, pending = pending.split(b"\n")
+                        tail.extend(complete)
+                        if len(tail) > 120:
+                            del tail[:-60]
                 else:
                     selector.unregister(key.fileobj)
     finally:
@@ -563,11 +769,14 @@ def run_command(command: str, repo: pathlib.Path, deadline: float, writer: Repor
             process.wait(timeout=2)
         selector.close()
         process.stdout.close()
+    if pending:
+        tail.append(pending)
     return CommandResult(
         command,
         None if timed_out else process.returncode,
         timed_out,
         time.monotonic() - started,
+        tuple(line.decode("utf-8", "replace")[:400] for line in tail[-30:]),
     )
 
 
@@ -615,7 +824,8 @@ def competing_working_pane(repo: pathlib.Path, pane_id: str | None, state: Mappi
     return None
 
 
-def validate_feedback_target(pane_id: str, repo: pathlib.Path, expected_identity: Mapping[str, Any]) -> tuple[bool, str]:
+def validate_feedback_target(pane_id: str, repo: pathlib.Path, expected_identity: Mapping[str, Any],
+                             inferred: bool = False) -> tuple[bool, str]:
     try:
         pane = next((item for item in list_agents() if item.get("pane_id") == pane_id), {})
         if pane.get("agent_status") != "done":
@@ -626,7 +836,9 @@ def validate_feedback_target(pane_id: str, repo: pathlib.Path, expected_identity
         if expected_identity.get("state_change_seq") is None or pane.get("state_change_seq") != expected_identity["state_change_seq"]:
             return False, "agent turn changed during verification"
         current_repo = resolve_pane_repo(pane, load_state())
-        if current_repo != repo:
+        # An inferred repository never resolves from the pane, so equality is only
+        # required when the pane does point somewhere of its own.
+        if current_repo != repo and not (inferred and current_repo is None):
             return False, "pane binding or repository changed"
         return True, ""
     except BrigadeError as exc:
@@ -659,6 +871,134 @@ def increment_feedback(state: dict[str, Any], pane_id: str, repo: pathlib.Path, 
     item["updated_at"] = utc_now()
 
 
+def load_baseline(repo: pathlib.Path) -> dict[str, int]:
+    """Exit codes a repository is already known to produce before any agent touched it.
+
+    Most real repositories are not green.  Without this, the first honest run
+    accuses every agent of failures it inherited, and two prompts later the gate
+    has taught its user to ignore it.
+    """
+    item = load_state().get("repos", {}).get(str(repo))
+    baseline = item.get("baseline") if isinstance(item, dict) else None
+    commands = baseline.get("commands") if isinstance(baseline, dict) else None
+    if not isinstance(commands, dict):
+        return {}
+    return {
+        key: value for key, value in commands.items()
+        if isinstance(key, str) and isinstance(value, int) and not isinstance(value, bool)
+    }
+
+
+def save_baseline(repo: pathlib.Path, results: Sequence[CommandResult], snapshot: str) -> int:
+    """Record only the commands that actually failed; a passing command needs no licence."""
+    tolerated = {
+        item.command: item.exit_code for item in results
+        if not item.timed_out and isinstance(item.exit_code, int) and item.exit_code != 0
+    }
+    with state_transaction() as state:
+        repo_state = state["repos"].setdefault(str(repo), {})
+        repo_state["baseline"] = {"captured_at": utc_now(), "fingerprint": snapshot, "commands": tolerated}
+    return len(tolerated)
+
+
+def sanitize_for_prompt(text: str) -> str:
+    """Herdr input is typed into a live shell, so a backtick must never survive."""
+    cleaned = "".join(" " if character < " " or character == "\x7f" else character for character in text)
+    return " ".join(cleaned.replace("`", "'").split())
+
+
+def last_meaningful_line(tail: Sequence[str]) -> str:
+    """Checkers put their verdict last: the error count, the failing assertion, the summary."""
+    for line in reversed(tail):
+        stripped = line.strip()
+        if len(stripped) >= 3:
+            return stripped
+    return ""
+
+
+def failure_message(results: Sequence[CommandResult], regressions: Sequence[CommandResult],
+                    verdict: str, pointer: pathlib.Path) -> str:
+    """Three lines, because that is all Herdr will reliably deliver."""
+    timed_out = next((item for item in results if item.timed_out), None)
+    # The command is trimmed, never the exit code: a truncated head that loses the
+    # code tells the agent less than naming no command at all.
+    if timed_out is not None:
+        head = f"Kitchen Brigade: {sanitize_for_prompt(timed_out.command)[:140]} timed out."
+        detail = "It consumed the whole suite budget, so nothing after it ran."
+    elif regressions:
+        first = regressions[0]
+        head = f"Kitchen Brigade: {sanitize_for_prompt(first.command)[:140]} failed, exit {first.exit_code}."
+        detail = sanitize_for_prompt(last_meaningful_line(first.tail)) or "The report has the output."
+    else:
+        head = f"Kitchen Brigade: verification ended as {verdict}."
+        detail = "Nothing certified this snapshot."
+    return f"{head[:240]}\n{detail[:240]}\nRead {pointer} and fix it before reporting done."
+
+
+def write_repo_summary(repo: pathlib.Path, text: str) -> pathlib.Path | None:
+    """Put a short summary inside the repository, where a sandboxed agent can read it.
+
+    The directory ignores itself, so it never enters a snapshot and the agent's
+    own pointer file cannot invalidate the tree it describes.
+    """
+    directory = repo / SCRATCH_DIR
+    try:
+        directory.mkdir(exist_ok=True, mode=0o700)
+        (directory / ".gitignore").write_text("*\n", encoding="utf-8")
+        path = directory / SUMMARY_NAME
+        path.write_text(text, encoding="utf-8")
+        return path
+    except OSError as exc:
+        append_event("summary_error", repo=str(repo), error=str(exc))
+        return None
+
+
+def summary_text(repo: pathlib.Path, verdict: str, config: Config, results: Sequence[CommandResult],
+                 regressions: Sequence[CommandResult], tolerated: Sequence[CommandResult],
+                 report: pathlib.Path, changed: Sequence[str] | None = None,
+                 cited: Sequence[str] = (), config_edited: bool = False) -> str:
+    lines = [
+        "Kitchen Brigade verification summary",
+        f"Repository: {repo}",
+        f"Time: {utc_now()}",
+        f"Verdict: {verdict.upper()}",
+        f"Commands: {len(results)} of {len(config.commands)} run",
+        "",
+    ]
+    if config_edited:
+        lines += [f"ALERT: {CONFIG_NAME} changed in this snapshot. The checks themselves were edited.", ""]
+    tolerated_commands = {item.command for item in tolerated}
+    regressed_commands = {item.command for item in regressions}
+    for item in results:
+        if item.timed_out:
+            label = "TIMED OUT"
+        elif item.command in regressed_commands:
+            label = f"REGRESSED exit {item.exit_code}"
+        elif item.command in tolerated_commands:
+            label = f"pre-existing exit {item.exit_code}, matches baseline"
+        else:
+            label = f"ok exit {item.exit_code}"
+        lines.append(f"  {label}  {item.command}")
+    if changed is None:
+        lines += ["", "Changed since the last check: unknown, there is no earlier snapshot."]
+    elif not changed:
+        lines += ["", "Nothing changed since the last check, so this failure predates your work."]
+    else:
+        lines += ["", f"Changed since the last check: {len(changed)} path(s)."]
+        if cited:
+            lines.append(f"This failure names {len(cited)} of them:")
+            lines += [f"  {name}" for name in cited[:MAX_LISTED_PATHS]]
+        else:
+            lines.append("This failure names none of them, so it may not be caused by your changes.")
+    focus = next(iter(regressions), None) or next((item for item in results if item.timed_out), None)
+    if focus is not None and focus.tail:
+        lines += ["", f"Last output from {focus.command}:"]
+        room = max(4, MAX_SUMMARY_LINES - len(lines) - 3)
+        lines += [f"  {line}" for line in focus.tail[-room:]]
+    lines += ["", f"Full output: {report}"]
+    return "\n".join(lines) + "\n"
+
+
 def route_result(
     *,
     repo: pathlib.Path,
@@ -668,24 +1008,33 @@ def route_result(
     verdict: str,
     fingerprint_value: str,
     report: pathlib.Path,
+    notify_only: bool = False,
+    inferred: bool = False,
+    pointer: pathlib.Path | None = None,
+    message: str | None = None,
 ) -> None:
     # A foreground/manual run without --pane is deliberately log-only.
     if pane_id is None:
         return
-    if verdict == "pass":
+    pointer = pointer or report
+    if verdict in {"pass", "baseline"}:
         if config.on_pass == "notify":
-            ok, error = notify("Kitchen Brigade passed", f"{repo.name}: all checks passed")
+            body = ("all checks passed" if verdict == "pass"
+                    else "no regressions; pre-existing failures match the baseline")
+            ok, error = notify("Kitchen Brigade passed", f"{repo.name}: {body}")
             if not ok:
                 append_to_report(report, f"\nNotification delivery failed: {error}\n")
         return
     if config.on_fail == "log":
         return
-    if config.on_fail == "notify" or expected_identity is None or verdict in {"changed", "error"}:
-        ok, error = notify("Kitchen Brigade failed", f"{repo.name}: {verdict}. Report: {report}")
+    if config.on_fail == "notify" or notify_only or expected_identity is None or verdict in {"changed", "error"}:
+        if notify_only:
+            append_to_report(report, "\nPrompt withheld: repository was inferred while another agent was working.\n")
+        ok, error = notify("Kitchen Brigade failed", f"{repo.name}: {verdict}. Report: {pointer}")
         if not ok:
             append_to_report(report, f"\nNotification delivery failed: {error}\n")
         return
-    safe, reason = validate_feedback_target(pane_id, repo, expected_identity)
+    safe, reason = validate_feedback_target(pane_id, repo, expected_identity, inferred)
     if not safe:
         ok, error = notify("Kitchen Brigade did not prompt", f"{repo.name}: {reason}. Report: {report}")
         append_to_report(report, f"\nPrompt withheld: {reason}\n")
@@ -702,7 +1051,8 @@ def route_result(
         append_to_report(report, "\nPrompt suppressed: feedback limit reached for this pane/repository snapshot.\n")
         append_event("prompt_suppressed", pane_id=pane_id, repo=str(repo), reason="feedback_limit")
         return
-    message = f"Kitchen Brigade found verification failures.\nRead {report}\nFix them, rerun the checks, and report done again."
+    if message is None:
+        message = f"Kitchen Brigade found verification failures.\nRead {pointer}\nFix them, rerun the checks, and report done again."
     ok, error = prompt(pane_id, message)
     if not ok:
         append_to_report(report, f"\nPrompt delivery failed: {error}\n")
@@ -733,7 +1083,8 @@ def write_error_report(repo: pathlib.Path, reason: str, pane_id: str | None = No
     return path
 
 
-def verify(repo: pathlib.Path, pane_id: str | None, force: bool, automatic: bool) -> int:
+def verify(repo: pathlib.Path, pane_id: str | None, force: bool, automatic: bool,
+           notify_only: bool = False, inferred: bool = False) -> int:
     repo = repo_root(repo)
     prune_reports()
     expected_identity: dict[str, Any] | None = None
@@ -775,7 +1126,9 @@ def verify(repo: pathlib.Path, pane_id: str | None, force: bool, automatic: bool
                 _record_repo_state(repo, verdict="skipped", reason=reason, pane_id=pane_id)
                 return 0
             try:
-                before = fingerprint(repo)
+                current_snapshot = capture_snapshot(repo)
+                before = current_snapshot.digest
+                changed_paths = changed_since(load_snapshot(repo), current_snapshot)
                 if load_config(repo) != config:
                     raise BrigadeError("configuration changed before verification could start")
             except BrigadeError as exc:
@@ -796,8 +1149,14 @@ def verify(repo: pathlib.Path, pane_id: str | None, force: bool, automatic: bool
                     append_event("skip", repo=str(repo), pane_id=pane_id, reason="unchanged_failure")
                     return 0
 
+            # An agent editing its own gate is the single most interesting thing
+            # this plugin can observe.  A foreground run is the operator editing
+            # their own config, which is not the same event.
+            config_edited = bool(pane_id) and changed_paths is not None and CONFIG_NAME in changed_paths
             path = report_path(repo, "running")
             results: list[CommandResult] = []
+            regressions: list[CommandResult] = []
+            tolerated: list[CommandResult] = []
             deadline = time.monotonic() + config.timeout_seconds
             _record_repo_state(repo, verdict="running", pane_id=pane_id, report=str(path), reason="checks in progress")
             with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600), "w+b") as raw:
@@ -807,6 +1166,19 @@ def verify(repo: pathlib.Path, pane_id: str | None, force: bool, automatic: bool
                     f"Pane: {pane_id or '-'}\nFingerprint before: {before}\n"
                     f"Timeout: {config.timeout_seconds:g}s (whole suite)\n"
                 )
+                if changed_paths is None:
+                    writer.write("Changed since last check: unknown (no earlier snapshot)\n")
+                else:
+                    writer.write(f"Changed since last check: {len(changed_paths)} path(s)\n")
+                    for name in changed_paths[:MAX_LISTED_PATHS]:
+                        writer.write(f"  {name}\n")
+                    if len(changed_paths) > MAX_LISTED_PATHS:
+                        writer.write(f"  ... and {len(changed_paths) - MAX_LISTED_PATHS} more\n")
+                if config_edited:
+                    writer.write(f"ALERT: {CONFIG_NAME} changed in this snapshot; the checks themselves were edited.\n")
+                baseline = load_baseline(repo)
+                if baseline:
+                    writer.write(f"Baseline: {len(baseline)} command(s) already failed before this snapshot\n")
                 for index, command in enumerate(config.commands, 1):
                     writer.write(f"\n[{index}/{len(config.commands)}] $ {command}\n")
                     result = run_command(command, repo, deadline, writer)
@@ -814,31 +1186,52 @@ def verify(repo: pathlib.Path, pane_id: str | None, force: bool, automatic: bool
                     if result.timed_out:
                         writer.write(f"\nTIMED OUT after {result.duration_seconds:.2f}s\n")
                         break
-                    writer.write(f"\nExit: {result.exit_code} ({result.duration_seconds:.2f}s)\n")
+                    expected = baseline.get(command)
+                    inherited = result.exit_code != 0 and expected is not None and result.exit_code == expected
+                    label = "ok" if result.exit_code == 0 else ("PRE-EXISTING" if inherited else "REGRESSED")
+                    writer.write(f"\nExit: {result.exit_code} ({result.duration_seconds:.2f}s) {label}\n")
+                    if inherited:
+                        # Never stop on a failure the agent inherited, or one stale
+                        # lint error hides every regression behind it.
+                        tolerated.append(result)
+                        continue
                     if result.exit_code != 0:
-                        break
+                        regressions.append(result)
+                        if config.stop_on_first_failure:
+                            break
                 try:
                     after = fingerprint(repo)
                 except BrigadeError as exc:
                     after = f"error:{exc}"
                 changed = after != before
-                failed = next((item for item in results if item.timed_out or item.exit_code != 0), None)
+                timed_out = next((item for item in results if item.timed_out), None)
                 if changed:
                     verdict = "changed"
                     exit_code = 2
                     writer.write(f"\nREFUSED: repository changed during verification.\nFingerprint after: {after}\n")
-                elif failed is not None:
-                    verdict = "timeout" if failed.timed_out else ("error" if failed.exit_code in {126, 127} else "fail")
+                elif timed_out is not None:
+                    verdict = "timeout"
+                    exit_code = 1
+                    writer.write("\nVerdict: TIMEOUT\n")
+                elif regressions:
+                    verdict = "error" if any(item.exit_code in {126, 127} for item in regressions) else "fail"
                     exit_code = 2 if verdict == "error" else 1
                     writer.write(f"\nVerdict: {verdict.upper()}\n")
+                    writer.write("Regressed: " + ", ".join(item.command for item in regressions) + "\n")
                 elif len(results) != len(config.commands):
                     verdict = "error"
                     exit_code = 2
                     writer.write("\nVerdict: ERROR (suite did not complete)\n")
+                elif tolerated:
+                    verdict = "baseline"
+                    exit_code = 0
+                    writer.write("\nVerdict: BASELINE (no regressions)\n")
                 else:
                     verdict = "pass"
                     exit_code = 0
                     writer.write("\nVerdict: PASS\n")
+                if tolerated:
+                    writer.write("Pre-existing, tolerated: " + ", ".join(item.command for item in tolerated) + "\n")
                 writer.finish()
             final_path = path.with_name(path.name.replace("-running.txt", f"-{verdict}.txt"))
             os.replace(path, final_path)
@@ -850,13 +1243,43 @@ def verify(repo: pathlib.Path, pane_id: str | None, force: bool, automatic: bool
                 )
                 repo_state.pop("reason", None)
                 repo_state.pop("verified_fingerprint", None)
-                if verdict == "pass":
+                if verdict in {"pass", "baseline"}:
                     repo_state["verified_fingerprint"] = before
                     scope = session_scope() or "no-session"
                     if pane_id:
                         feedback_key = hashlib.sha256(os.fsencode(f"{scope}\0{pane_id}\0{repo}")).hexdigest()
                         state["feedback"].pop(feedback_key, None)
-            append_event("verdict", repo=str(repo), pane_id=pane_id, verdict=verdict, report=str(final_path), fingerprint=before)
+            # Written only after the post-run fingerprint, so the summary can never
+            # be mistaken for the agent changing the tree during verification.
+            if verdict != "changed":
+                save_snapshot(repo, current_snapshot)
+            cited: list[str] = []
+            pointer = final_path
+            if verdict in {"fail", "timeout", "error"}:
+                focus = next(iter(regressions), None) or next((item for item in results if item.timed_out), None)
+                position = next((i for i, item in enumerate(results, 1) if item is focus), None)
+                if changed_paths and focus is not None and position is not None:
+                    cited = cited_changed_paths(
+                        command_output(final_path, position, len(config.commands), focus.command),
+                        repo, changed_paths,
+                    )
+                summary = write_repo_summary(
+                    repo, summary_text(repo, verdict, config, results, regressions, tolerated,
+                                       final_path, changed_paths, cited, config_edited)
+                )
+                if summary is not None:
+                    pointer = summary
+            if config_edited:
+                append_event("config_edited", repo=str(repo), pane_id=pane_id, verdict=verdict)
+                # on_fail = log is an explicit request for silence, so the alarm
+                # goes to the report, the audit log and doctor instead, where it
+                # cannot be lost but does not break the stated contract.
+                if config.on_fail != "log":
+                    notify("Kitchen Brigade: the checks were edited",
+                           f"{repo.name}: {CONFIG_NAME} changed in the snapshot just verified ({verdict}).")
+            append_event("verdict", repo=str(repo), pane_id=pane_id, verdict=verdict,
+                         report=str(final_path), fingerprint=before,
+                         regressed=len(regressions), tolerated=len(tolerated))
             route_result(
                 repo=repo,
                 pane_id=pane_id,
@@ -865,9 +1288,13 @@ def verify(repo: pathlib.Path, pane_id: str | None, force: bool, automatic: bool
                 verdict=verdict,
                 fingerprint_value=before,
                 report=final_path,
+                notify_only=notify_only,
+                inferred=inferred,
+                pointer=pointer,
+                message=failure_message(results, regressions, verdict, pointer),
             )
             if not automatic:
-                print(f"Kitchen Brigade: {verdict}. Report: {final_path}")
+                print(f"Kitchen Brigade: {verdict}. Report: {pointer}")
             return exit_code
     except BusyError as exc:
         append_event("skip", repo=str(repo), pane_id=pane_id, reason="busy")
@@ -899,6 +1326,43 @@ def detached_worker(pane_id: str, force: bool = False, automatic: bool = False) 
     append_event("dispatched", pane_id=pane_id, force=force)
 
 
+def infer_repo_for_pane(pane_id: str) -> tuple[pathlib.Path | None, bool]:
+    """Pick a watched repository for a pane whose directory told us nothing.
+
+    Returns the repository and whether feedback must be downgraded to a
+    notification.  Inference cannot prove which agent did the work, so it only
+    types at the finishing pane while no other agent is working.
+    """
+    candidates, problems = watched_candidates()
+    for problem in problems:
+        append_event("watch_error", pane_id=pane_id, detail=problem)
+    if not candidates:
+        # Quiet because nothing moved is healthy; quiet because nothing is watched
+        # is the failure doctor must shout about, so they are separate reasons.
+        eligible = [key for key in load_state().get("watched", {})
+                    if (pathlib.Path(key) / CONFIG_NAME).is_file()]
+        append_event("skip", pane_id=pane_id,
+                     reason="no_watched_change" if eligible else "no_repository_or_binding")
+        return None, False
+    if len(candidates) > 1:
+        names = ", ".join(repo.name for repo, _ in candidates)
+        append_event("skip", pane_id=pane_id, reason="ambiguous_watched",
+                     candidates=[str(repo) for repo, _ in candidates])
+        notify("Kitchen Brigade could not attribute a check",
+               f"{len(candidates)} watched repositories changed ({names}). Run a check with --repo.")
+        return None, False
+    repo, snapshot = candidates[0]
+    mark_watched_seen(repo, snapshot)
+    try:
+        busy = any(item.get("pane_id") != pane_id and item.get("agent_status") == "working"
+                   for item in list_agents())
+    except BrigadeError as exc:
+        append_event("transport_error", transport="infer_agent_list", error=str(exc))
+        busy = True
+    append_event("inferred", pane_id=pane_id, repo=str(repo), notify_only=busy)
+    return repo, busy
+
+
 def worker(pane_id: str, force: bool, automatic: bool = False) -> int:
     with contextlib.suppress(OSError):
         os.nice(19)
@@ -909,10 +1373,14 @@ def worker(pane_id: str, force: bool, automatic: bool = False) -> int:
             return 0
         state = load_state()
         repo = resolve_pane_repo(pane, state)
+        notify_only = inferred = False
         if repo is None:
-            append_event("skip", pane_id=pane_id, reason="no_repository_or_binding")
-            return 0
-        return verify(repo, pane_id, force, automatic=automatic)
+            repo, notify_only = infer_repo_for_pane(pane_id)
+            if repo is None:
+                return 0
+            inferred = True
+        return verify(repo, pane_id, force, automatic=automatic,
+                      notify_only=notify_only, inferred=inferred)
     except BaseException as exc:
         detail = "".join(traceback.format_exception(exc))[-8000:]
         append_event("worker_crash", pane_id=pane_id, error=str(exc))
@@ -983,6 +1451,198 @@ def command_unbind(pane_id: str) -> int:
     return 0
 
 
+def recent_events(hours: float = 24.0) -> list[dict[str, Any]]:
+    """Read back the audit records this plugin already writes."""
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+    root = ensure_state_dirs()
+    found: list[dict[str, Any]] = []
+    for name in ("events.previous.jsonl", "events.jsonl"):
+        try:
+            text = (root / name).read_text(encoding="utf-8", errors="replace")
+        except (FileNotFoundError, OSError):
+            continue
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+                when = dt.datetime.fromisoformat(item["time"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue
+            if not isinstance(item, dict):
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=dt.timezone.utc)
+            if when >= cutoff:
+                found.append(item)
+    return found
+
+
+def activity_summary(hours: float = 24.0) -> dict[str, Any]:
+    """What the gate actually did, as opposed to whether it is wired up."""
+    events = recent_events(hours)
+    skips: dict[str, int] = {}
+    verdicts: dict[str, int] = {}
+    attributed = 0
+    for item in events:
+        kind = item.get("kind")
+        if kind == "skip":
+            reason = str(item.get("reason", "unknown"))
+            skips[reason] = skips.get(reason, 0) + 1
+        elif kind == "verdict":
+            value = str(item.get("verdict", "unknown"))
+            verdicts[value] = verdicts.get(value, 0) + 1
+            # A foreground run carries no pane, so it says nothing about whether
+            # the gate is catching agents.  Only pane-attributed verdicts count.
+            attributed += bool(item.get("pane_id"))
+    return {
+        "hours": hours,
+        "dispatched": sum(1 for item in events if item.get("kind") == "dispatched"),
+        "verified": attributed,
+        "verdicts": verdicts,
+        "manual": sum(verdicts.values()) - attributed,
+        "skipped": sum(skips.values()),
+        "skips": skips,
+        "inferred": sum(1 for item in events if item.get("kind") == "inferred"),
+        "config_edited": sum(1 for item in events if item.get("kind") == "config_edited"),
+        "crashes": sum(1 for item in events if item.get("kind") in {"worker_crash", "event_crash"}),
+    }
+
+
+def command_watch(repo: str | None, root: str | None, as_list: bool) -> int:
+    """Register repositories the gate may check when a pane resolves to nothing."""
+    if as_list:
+        watched = load_state().get("watched", {})
+        if not watched:
+            print("Kitchen Brigade: no watched repositories.")
+            return 0
+        for key in sorted(watched):
+            marker = "ok" if (pathlib.Path(key) / CONFIG_NAME).is_file() else "no config"
+            print(f"{marker:9} {key}")
+        return 0
+    if not repo and not root:
+        raise BrigadeError("watch needs --repo, --root, or --list")
+    found: list[pathlib.Path] = []
+    if repo:
+        found.append(repo_root(repo))
+    if root:
+        base = pathlib.Path(root).expanduser()
+        if not base.is_dir():
+            raise BrigadeError(f"not a directory: {base}")
+        # A scan only adopts repositories that already opted in, so pointing at a
+        # projects directory cannot silently enrol everything under it.
+        for child in sorted(base.iterdir()):
+            if not child.is_dir() or not (child / CONFIG_NAME).is_file():
+                continue
+            try:
+                resolved = repo_root(child)
+            except BrigadeError:
+                continue
+            if resolved == child.resolve() and resolved not in found:
+                found.append(resolved)
+    if not found:
+        print(f"Kitchen Brigade: found no repository carrying {CONFIG_NAME}.")
+        return 0
+    # Seed each new entry with its current snapshot.  The registry answers which
+    # repository has new work, and at registration nothing is new; without this,
+    # registering several repositories makes the next completion ambiguous by
+    # construction and no check runs at all.
+    seeds: dict[str, str] = {}
+    for item in found:
+        if not (item / CONFIG_NAME).is_file():
+            continue
+        try:
+            captured = capture_snapshot(item)
+        except (BrigadeError, OSError) as exc:
+            append_event("watch_error", repo=str(item), detail=str(exc))
+            continue
+        seeds[str(item)] = captured.digest
+        if load_snapshot(item) is None:
+            save_snapshot(item, captured)
+    fresh: list[pathlib.Path] = []
+    with state_transaction() as state:
+        watched = state.setdefault("watched", {})
+        for item in found:
+            entry = watched.setdefault(str(item), {})
+            entry.setdefault("added_at", utc_now())
+            # Seeding is also the repair path: an entry with no snapshot is a
+            # permanent candidate, and several of those make every completion
+            # ambiguous.  Re-running watch is the idempotent way to fix that.
+            if entry.get("last_seen_fingerprint") is None and str(item) in seeds:
+                fresh.append(item)
+                entry["last_seen_fingerprint"] = seeds[str(item)]
+                entry["last_seen_at"] = utc_now()
+            entry["source"] = "root" if root else "repo"
+    for item in found:
+        note = "" if (item / CONFIG_NAME).is_file() else f"  (no {CONFIG_NAME} yet, so it will be skipped)"
+        print(f"Watching {item}{note}")
+        append_event("watch_added", repo=str(item), seeded=str(item) in seeds)
+    if fresh:
+        print("Checks start at the next change. For a verdict on the current tree now, use accept or run --repo.")
+    return 0
+
+
+def command_accept(path: str) -> int:
+    """Record what this repository already fails, so later runs only report regressions.
+
+    Every command runs regardless of its exit code: a baseline that stopped at the
+    first failure would licence nothing beyond it.
+    """
+    repo = repo_root(path)
+    config = load_config(repo)
+    if config is None:
+        raise BrigadeError(f"{repo} has no {CONFIG_NAME}")
+    results: list[CommandResult] = []
+    with verification_locks(repo):
+        captured = capture_snapshot(repo)
+        snapshot = captured.digest
+        save_snapshot(repo, captured)
+        deadline = time.monotonic() + config.timeout_seconds
+        report = report_path(repo, "baseline")
+        with os.fdopen(os.open(report, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600), "w+b") as raw:
+            writer = ReportWriter(raw)
+            writer.write(
+                f"Kitchen Brigade baseline capture\nTime: {utc_now()}\nRepository: {repo}\n"
+                f"Fingerprint: {snapshot}\nTimeout: {config.timeout_seconds:g}s (whole suite)\n"
+            )
+            for index, command in enumerate(config.commands, 1):
+                writer.write(f"\n[{index}/{len(config.commands)}] $ {command}\n")
+                result = run_command(command, repo, deadline, writer)
+                results.append(result)
+                if result.timed_out:
+                    writer.write(f"\nTIMED OUT after {result.duration_seconds:.2f}s\n")
+                    break
+                writer.write(f"\nExit: {result.exit_code} ({result.duration_seconds:.2f}s)\n")
+            writer.finish()
+    if any(item.timed_out for item in results) or len(results) != len(config.commands):
+        raise BrigadeError(f"the suite did not complete, so no baseline was recorded. Report: {report}")
+    count = save_baseline(repo, results, snapshot)
+    # Capturing a baseline is itself a look at this snapshot, so a watched
+    # repository must not be re-selected for the same tree afterwards.
+    if str(repo) in load_state().get("watched", {}):
+        mark_watched_seen(repo, snapshot)
+    append_event("baseline_captured", repo=str(repo), tolerated=count, fingerprint=snapshot)
+    print(f"Kitchen Brigade: baseline recorded for {repo}.")
+    if count:
+        print(f"{count} command(s) may keep failing with the same exit code; anything else is a regression:")
+        for item in results:
+            if item.exit_code != 0:
+                print(f"  exit {item.exit_code}  {item.command}")
+    else:
+        print("Every command passed, so nothing is tolerated and any failure is a regression.")
+    print(f"Capture report: {report}")
+    return 0
+
+
+def command_unwatch(repo: str) -> int:
+    target = str(repo_root(repo))
+    with state_transaction() as state:
+        removed = state.setdefault("watched", {}).pop(target, None)
+    append_event("watch_removed", repo=target, existed=bool(removed))
+    print(f"Stopped watching {target}" if removed else f"Was not watching {target}")
+    return 0
+
+
 def status_data() -> dict[str, Any]:
     state = load_state()
     return {
@@ -991,6 +1651,8 @@ def status_data() -> dict[str, Any]:
         "session_scope": session_scope(),
         "repos": state.get("repos", {}),
         "bindings": state.get("bindings", {}),
+        "watched": state.get("watched", {}),
+        "activity_24h": activity_summary(),
     }
 
 
@@ -1034,6 +1696,55 @@ def command_board() -> int:
     return 0
 
 
+def outcome_checks() -> list[tuple[str, bool, str]]:
+    """Health is what the gate produced, not only what it is connected to.
+
+    A gate that receives every event and verifies nothing looks identical to a
+    healthy one from the wiring checks alone, which is how this plugin spent its
+    first day dead while reporting ok on every line.
+    """
+    checks: list[tuple[str, bool, str]] = []
+    activity = activity_summary()
+    dispatched, verified = activity["dispatched"], activity["verified"]
+    checks.append((
+        "Done events (24h)",
+        not (dispatched and not verified),
+        f"{dispatched} dispatched, {verified} verified, {activity['skipped']} skipped",
+    ))
+    if activity["skips"]:
+        ranked = sorted(activity["skips"].items(), key=lambda item: (-item[1], item[0]))
+        summary = ", ".join(f"{reason} x{count}" for reason, count in ranked[:3])
+        unresolved = activity["skips"].get("no_repository_or_binding", 0)
+        checks.append(("Skip reasons (24h)", not (unresolved and not verified), summary))
+    checks.append(("Crashes (24h)", activity["crashes"] == 0, str(activity["crashes"])))
+    edited = activity["config_edited"]
+    checks.append((
+        "Checks edited by an agent (24h)",
+        edited == 0,
+        "none" if not edited else f"{edited} verification(s) ran on a snapshot that changed {CONFIG_NAME}",
+    ))
+    try:
+        state = load_state()
+    except BrigadeError as exc:
+        checks.append(("Watched repositories", False, str(exc)))
+        return checks
+    watched = state.get("watched", {})
+    repos = state.get("repos", {})
+    checks.append(("Watched repositories", bool(watched) or bool(state.get("bindings")),
+                   f"{len(watched)} watched; run watch --root to register some" if not watched
+                   else f"{len(watched)} watched"))
+    for key in sorted(watched):
+        item = repos.get(key) if isinstance(repos.get(key), dict) else {}
+        name = pathlib.Path(key).name
+        if not (pathlib.Path(key) / CONFIG_NAME).is_file():
+            checks.append((f"Watched {name}", False, f"no {CONFIG_NAME} at {key}"))
+        elif item and item.get("last_run_at"):
+            checks.append((f"Watched {name}", True, f"{item.get('last_result', '?')} at {item['last_run_at']}"))
+        else:
+            checks.append((f"Watched {name}", True, "no check recorded yet"))
+    return checks
+
+
 def command_doctor() -> int:
     checks: list[tuple[str, bool, str]] = []
     checks.append(("Python", sys.version_info >= (3, 11), sys.version.split()[0]))
@@ -1047,6 +1758,7 @@ def command_doctor() -> int:
             checks.append(("Herdr connection", isinstance(value, dict), "agent list succeeded"))
         except BrigadeError as exc:
             checks.append(("Herdr connection", False, str(exc)))
+    checks.extend(outcome_checks())
     failed = False
     for name, ok, detail in checks:
         print(f"{'ok' if ok else 'FAIL':4} {name}: {detail}")
@@ -1083,6 +1795,14 @@ def build_parser() -> argparse.ArgumentParser:
     bind.add_argument("--repo", required=True)
     unbind = sub.add_parser("unbind", help="remove this session's pane binding")
     unbind.add_argument("--pane", required=True)
+    watch = sub.add_parser("watch", help="register repositories to check when a pane resolves to nothing")
+    watch.add_argument("--repo")
+    watch.add_argument("--root", help="adopt every repository directly under this directory that has opted in")
+    watch.add_argument("--list", action="store_true", dest="as_list")
+    unwatch = sub.add_parser("unwatch", help="stop watching a repository")
+    unwatch.add_argument("--repo", required=True)
+    accept = sub.add_parser("accept", help="record this repository's existing failures as its baseline")
+    accept.add_argument("--repo", required=True)
     status = sub.add_parser("status", help="show recorded verdicts")
     status.add_argument("--json", action="store_true")
     sub.add_parser("doctor", help="check local runtime health")
@@ -1112,6 +1832,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return command_bind(args.pane, args.repo)
         if args.command == "unbind":
             return command_unbind(args.pane)
+        if args.command == "watch":
+            return command_watch(args.repo, args.root, args.as_list)
+        if args.command == "unwatch":
+            return command_unwatch(args.repo)
+        if args.command == "accept":
+            return command_accept(args.repo)
         if args.command == "status":
             return command_status(args.json)
         if args.command == "doctor":
